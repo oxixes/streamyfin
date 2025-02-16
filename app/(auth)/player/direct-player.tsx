@@ -3,32 +3,31 @@ import { Text } from "@/components/common/Text";
 import { Loader } from "@/components/Loader";
 import { Controls } from "@/components/video-player/controls/Controls";
 import { getDownloadedFileUrl } from "@/hooks/useDownloadedFileOpener";
-import { useOrientation } from "@/hooks/useOrientation";
-import { useOrientationSettings } from "@/hooks/useOrientationSettings";
 import { useInvalidatePlaybackProgressCache } from "@/hooks/useRevalidatePlaybackProgressCache";
 import { useWebSocket } from "@/hooks/useWebsockets";
 import { VlcPlayerView } from "@/modules/vlc-player";
 import {
+  PipStartedPayload,
   PlaybackStatePayload,
   ProgressUpdatePayload,
   VlcPlayerViewRef,
 } from "@/modules/vlc-player/src/VlcPlayer.types";
-import { useDownload } from "@/providers/DownloadProvider";
+// import { useDownload } from "@/providers/DownloadProvider";
+const downloadProvider = !Platform.isTV
+  ? require("@/providers/DownloadProvider")
+  : null;
 import { apiAtom, userAtom } from "@/providers/JellyfinProvider";
-import { getBackdropUrl } from "@/utils/jellyfin/image/getBackdropUrl";
 import { getStreamUrl } from "@/utils/jellyfin/media/getStreamUrl";
 import { writeToLog } from "@/utils/log";
 import native from "@/utils/profiles/native";
 import { msToTicks, ticksToSeconds } from "@/utils/time";
-import { Api } from "@jellyfin/sdk";
-import { BaseItemDto } from "@jellyfin/sdk/lib/generated-client";
 import {
   getPlaystateApi,
   getUserLibraryApi,
 } from "@jellyfin/sdk/lib/utils/api";
 import { useQuery } from "@tanstack/react-query";
 import { useHaptic } from "@/hooks/useHaptic";
-import { useFocusEffect, useGlobalSearchParams } from "expo-router";
+import { useGlobalSearchParams, useNavigation } from "expo-router";
 import { useAtomValue } from "jotai";
 import React, {
   useCallback,
@@ -37,25 +36,20 @@ import React, {
   useState,
   useEffect,
 } from "react";
-import {
-  Alert,
-  BackHandler,
-  View,
-  AppState,
-  AppStateStatus,
-  Platform,
-} from "react-native";
+import { Alert, View, AppState, AppStateStatus, Platform } from "react-native";
 import { useSharedValue } from "react-native-reanimated";
-import settings from "../(tabs)/(home)/settings";
 import { useSettings } from "@/utils/atoms/settings";
 import { useTranslation } from "react-i18next";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { MediaSourceInfo } from "@jellyfin/sdk/lib/generated-client";
 
 export default function page() {
+  console.log("Direct Player");
   const videoRef = useRef<VlcPlayerViewRef>(null);
   const user = useAtomValue(userAtom);
   const api = useAtomValue(apiAtom);
   const { t } = useTranslation();
+  const navigation = useNavigation();
 
   const [isPlaybackStopped, setIsPlaybackStopped] = useState(false);
   const [showControls, _setShowControls] = useState(true);
@@ -63,12 +57,16 @@ export default function page() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(true);
   const [isVideoLoaded, setIsVideoLoaded] = useState(false);
+  const [isPipStarted, setIsPipStarted] = useState(false);
 
   const progress = useSharedValue(0);
   const isSeeking = useSharedValue(false);
   const cacheProgress = useSharedValue(0);
+  let getDownloadedItem = null;
+  if (!Platform.isTV) {
+    getDownloadedItem = downloadProvider.useDownload();
+  }
 
-  const { getDownloadedItem } = useDownload();
   const revalidateProgressCache = useInvalidatePlaybackProgressCache();
 
   const lightHapticFeedback = useHaptic("light");
@@ -109,8 +107,8 @@ export default function page() {
   } = useQuery({
     queryKey: ["item", itemId],
     queryFn: async () => {
-      if (offline) {
-        const item = await getDownloadedItem(itemId);
+      if (offline && !Platform.isTV) {
+        const item = await getDownloadedItem.getDownloadedItem(itemId);
         if (item) return item.item;
       }
 
@@ -125,57 +123,80 @@ export default function page() {
     staleTime: 0,
   });
 
-  const {
-    data: stream,
-    isLoading: isLoadingStreamUrl,
-    isError: isErrorStreamUrl,
-  } = useQuery({
-    queryKey: ["stream-url", itemId, mediaSourceId, bitrateValue],
-    queryFn: async () => {
-      if (offline) {
-        const data = await getDownloadedItem(itemId);
-        if (!data?.mediaSource) return null;
+  const [stream, setStream] = useState<{
+    mediaSource: MediaSourceInfo;
+    url: string;
+    sessionId: string | undefined;
+  } | null>(null);
+  const [isLoadingStream, setIsLoadingStream] = useState(true);
+  const [isErrorStream, setIsErrorStream] = useState(false);
 
-        const url = await getDownloadedFileUrl(data.item.Id!);
+  useEffect(() => {
+    const fetchStream = async () => {
+      setIsLoadingStream(true);
+      setIsErrorStream(false);
 
-        if (item)
-          return {
-            mediaSource: data.mediaSource,
-            url,
-            sessionId: undefined,
-          };
+      try {
+        if (offline && !Platform.isTV) {
+          const data = await getDownloadedItem.getDownloadedItem(itemId);
+          if (!data?.mediaSource) {
+            setStream(null);
+            return;
+          }
+
+          const url = await getDownloadedFileUrl(data.item.Id!);
+
+          if (item) {
+            setStream({
+              mediaSource: data.mediaSource as MediaSourceInfo,
+              url,
+              sessionId: undefined,
+            });
+            return;
+          }
+        }
+
+        const res = await getStreamUrl({
+          api,
+          item,
+          startTimeTicks: item?.UserData?.PlaybackPositionTicks!,
+          userId: user?.Id,
+          audioStreamIndex: audioIndex,
+          maxStreamingBitrate: bitrateValue,
+          mediaSourceId: mediaSourceId,
+          subtitleStreamIndex: subtitleIndex,
+          deviceProfile: native,
+        });
+
+        if (!res) {
+          setStream(null);
+          return;
+        }
+
+        const { mediaSource, sessionId, url } = res;
+
+        if (!sessionId || !mediaSource || !url) {
+          Alert.alert(t("player.error"), t("player.failed_to_get_stream_url"));
+          setStream(null);
+          return;
+        }
+
+        setStream({
+          mediaSource,
+          sessionId,
+          url,
+        });
+      } catch (error) {
+        console.error("Error fetching stream:", error);
+        setIsErrorStream(true);
+        setStream(null);
+      } finally {
+        setIsLoadingStream(false);
       }
+    };
 
-      const res = await getStreamUrl({
-        api,
-        item,
-        startTimeTicks: item?.UserData?.PlaybackPositionTicks!,
-        userId: user?.Id,
-        audioStreamIndex: audioIndex,
-        maxStreamingBitrate: bitrateValue,
-        mediaSourceId: mediaSourceId,
-        subtitleStreamIndex: subtitleIndex,
-        deviceProfile: native,
-      });
-
-      if (!res) return null;
-
-      const { mediaSource, sessionId, url } = res;
-
-      if (!sessionId || !mediaSource || !url) {
-        Alert.alert(t("player.error"), t("player.failed_to_get_stream_url"));
-        return null;
-      }
-
-      return {
-        mediaSource,
-        sessionId,
-        url,
-      };
-    },
-    enabled: !!itemId && !!item,
-    staleTime: 0,
-  });
+    fetchStream();
+  }, [itemId, mediaSourceId]);
 
   const togglePlay = useCallback(async () => {
     if (!api) return;
@@ -183,37 +204,21 @@ export default function page() {
     lightHapticFeedback();
     if (isPlaying) {
       await videoRef.current?.pause();
-
-      if (!offline && stream) {
-        await getPlaystateApi(api).onPlaybackProgress({
-          itemId: item?.Id!,
-          audioStreamIndex: audioIndex ? audioIndex : undefined,
-          subtitleStreamIndex: subtitleIndex ? subtitleIndex : undefined,
-          mediaSourceId: mediaSourceId,
-          positionTicks: msToTicks(progress.value),
-          isPaused: true,
-          playMethod: stream.url?.includes("m3u8")
-            ? "Transcode"
-            : "DirectStream",
-          playSessionId: stream.sessionId,
-        });
-      }
     } else {
       videoRef.current?.play();
-      if (!offline && stream) {
-        await getPlaystateApi(api).onPlaybackProgress({
-          itemId: item?.Id!,
-          audioStreamIndex: audioIndex ? audioIndex : undefined,
-          subtitleStreamIndex: subtitleIndex ? subtitleIndex : undefined,
-          mediaSourceId: mediaSourceId,
-          positionTicks: msToTicks(progress.value),
-          isPaused: false,
-          playMethod: stream?.url.includes("m3u8")
-            ? "Transcode"
-            : "DirectStream",
-          playSessionId: stream.sessionId,
-        });
-      }
+    }
+
+    if (!offline && stream) {
+      await getPlaystateApi(api).onPlaybackProgress({
+        itemId: item?.Id!,
+        audioStreamIndex: audioIndex ? audioIndex : undefined,
+        subtitleStreamIndex: subtitleIndex ? subtitleIndex : undefined,
+        mediaSourceId: mediaSourceId,
+        positionTicks: msToTicks(progress.get()),
+        isPaused: !isPlaying,
+        playMethod: stream?.url.includes("m3u8") ? "Transcode" : "DirectStream",
+        playSessionId: stream.sessionId,
+      });
     }
   }, [
     isPlaying,
@@ -225,13 +230,13 @@ export default function page() {
     subtitleIndex,
     mediaSourceId,
     offline,
-    progress.value,
+    progress,
   ]);
 
   const reportPlaybackStopped = useCallback(async () => {
     if (offline) return;
 
-    const currentTimeInTicks = msToTicks(progress.value);
+    const currentTimeInTicks = msToTicks(progress.get());
 
     await getPlaystateApi(api!).onPlaybackStopped({
       itemId: item?.Id!,
@@ -249,25 +254,9 @@ export default function page() {
     videoRef.current?.stop();
   }, [videoRef, reportPlaybackStopped]);
 
-  // TODO: unused should remove.
-  const reportPlaybackStart = useCallback(async () => {
-    if (offline) return;
-
-    if (!stream) return;
-    await getPlaystateApi(api!).onPlaybackStart({
-      itemId: item?.Id!,
-      audioStreamIndex: audioIndex ? audioIndex : undefined,
-      subtitleStreamIndex: subtitleIndex ? subtitleIndex : undefined,
-      mediaSourceId: mediaSourceId,
-      playMethod: stream.url?.includes("m3u8") ? "Transcode" : "DirectStream",
-      playSessionId: stream?.sessionId ? stream?.sessionId : undefined,
-    });
-  }, [api, item, mediaSourceId, stream]);
-
   const onProgress = useCallback(
     async (data: ProgressUpdatePayload) => {
-      if (isSeeking.value === true) return;
-      if (isPlaybackStopped === true) return;
+      if (isSeeking.get() || isPlaybackStopped) return;
 
       const { currentTime } = data.nativeEvent;
 
@@ -275,7 +264,7 @@ export default function page() {
         setIsBuffering(false);
       }
 
-      progress.value = currentTime;
+      progress.set(currentTime);
 
       if (offline) return;
 
@@ -294,11 +283,8 @@ export default function page() {
         playSessionId: stream.sessionId,
       });
     },
-    [item?.Id, isPlaying, api, isPlaybackStopped, audioIndex, subtitleIndex]
+    [item?.Id, isSeeking, api, isPlaybackStopped, audioIndex, subtitleIndex]
   );
-
-  useOrientation();
-  useOrientationSettings();
 
   useWebSocket({
     isPlaying: isPlaying,
@@ -306,6 +292,11 @@ export default function page() {
     stopPlayback: stop,
     offline,
   });
+
+  const onPipStarted = useCallback((e: PipStartedPayload) => {
+    const { pipStarted } = e.nativeEvent;
+    setIsPipStarted(pipStarted);
+  }, []);
 
   const onPlaybackStateChanged = useCallback((e: PlaybackStatePayload) => {
     const { state, isBuffering, isPlaying } = e.nativeEvent;
@@ -336,101 +327,68 @@ export default function page() {
       : 0;
   }, [item]);
 
-  useFocusEffect(
-    React.useCallback(() => {
-      return async () => {
-        stop();
-      };
-    }, [])
-  );
-
-  const [appState, setAppState] = useState(AppState.currentState);
-
-  useEffect(() => {
-    const handleAppStateChange = (nextAppState: AppStateStatus) => {
-      if (appState.match(/inactive|background/) && nextAppState === "active") {
-        // Handle app coming to the foreground
-      } else if (nextAppState.match(/inactive|background/)) {
-        // Handle app going to the background
-        if (videoRef.current && videoRef.current.pause) {
-          videoRef.current.pause();
-        }
-      }
-      setAppState(nextAppState);
-    };
-
-    // Use AppState.addEventListener and return a cleanup function
-    const subscription = AppState.addEventListener(
-      "change",
-      handleAppStateChange
-    );
-
-    return () => {
-      // Cleanup the event listener when the component is unmounted
-      subscription.remove();
-    };
-  }, [appState]);
-
   // Preselection of audio and subtitle tracks.
-
   if (!settings) return null;
-
   let initOptions = [`--sub-text-scale=${settings.subtitleSize}`];
-  let externalTrack = { name: "", DeliveryUrl: "" };
 
-  const allSubs =
-    stream?.mediaSource.MediaStreams?.filter(
-      (sub) => sub.Type === "Subtitle"
-    ) || [];
-  const chosenSubtitleTrack = allSubs.find(
-    (sub) => sub.Index === subtitleIndex
-  );
   const allAudio =
     stream?.mediaSource.MediaStreams?.filter(
       (audio) => audio.Type === "Audio"
     ) || [];
+  const allSubs =
+    stream?.mediaSource.MediaStreams?.filter(
+      (sub) => sub.Type === "Subtitle"
+    ) || [];
+  const textSubs = allSubs.filter((sub) => sub.IsTextSubtitleStream);
+
+  const chosenSubtitleTrack = allSubs.find(
+    (sub) => sub.Index === subtitleIndex
+  );
   const chosenAudioTrack = allAudio.find((audio) => audio.Index === audioIndex);
 
-  // Direct playback CASE
-  if (!bitrateValue) {
-    // If Subtitle is embedded we can use the position to select it straight away.
-    if (chosenSubtitleTrack && !chosenSubtitleTrack.DeliveryUrl) {
-      initOptions.push(`--sub-track=${allSubs.indexOf(chosenSubtitleTrack)}`);
-    } else if (chosenSubtitleTrack && chosenSubtitleTrack.DeliveryUrl) {
-      // If Subtitle is external we need to pass the URL to the player.
-      externalTrack = {
-        name: chosenSubtitleTrack.DisplayTitle || "",
-        DeliveryUrl: `${api?.basePath || ""}${chosenSubtitleTrack.DeliveryUrl}`,
-      };
-    }
+  const notTranscoding = !stream?.mediaSource.TranscodingUrl;
+  if (
+    chosenSubtitleTrack &&
+    (notTranscoding || chosenSubtitleTrack.IsTextSubtitleStream)
+  ) {
+    const finalIndex = notTranscoding
+      ? allSubs.indexOf(chosenSubtitleTrack)
+      : textSubs.indexOf(chosenSubtitleTrack);
+    initOptions.push(`--sub-track=${finalIndex}`);
+  }
 
-    if (chosenAudioTrack)
-      initOptions.push(`--audio-track=${allAudio.indexOf(chosenAudioTrack)}`);
-  } else {
-    // Transcoded playback CASE
-    if (chosenSubtitleTrack?.DeliveryMethod === "Hls") {
-      externalTrack = {
-        name: `subs ${chosenSubtitleTrack.DisplayTitle}`,
-        DeliveryUrl: "",
-      };
-    }
+  if (notTranscoding && chosenAudioTrack) {
+    initOptions.push(`--audio-track=${allAudio.indexOf(chosenAudioTrack)}`);
   }
 
   const insets = useSafeAreaInsets();
+  useEffect(() => {
+    const beforeRemoveListener = navigation.addListener("beforeRemove", stop);
+    return () => {
+      beforeRemoveListener();
+    };
+  }, [navigation]);
 
-  if (!item || isLoadingItem || isLoadingStreamUrl || !stream)
+  if (!item || isLoadingItem || !stream)
     return (
       <View className="w-screen h-screen flex flex-col items-center justify-center bg-black">
         <Loader />
       </View>
     );
 
-  if (isErrorItem || isErrorStreamUrl)
+  if (isErrorItem || isErrorStream)
     return (
       <View className="w-screen h-screen flex flex-col items-center justify-center bg-black">
         <Text className="text-white">{t("player.error")}</Text>
       </View>
     );
+
+  const externalSubtitles = allSubs
+    .filter((sub: any) => sub.DeliveryMethod === "External")
+    .map((sub: any) => ({
+      name: sub.DisplayTitle,
+      DeliveryUrl: api?.basePath + sub.DeliveryUrl,
+    }));
 
   return (
     <View style={{ flex: 1, backgroundColor: "black" }}>
@@ -449,17 +407,18 @@ export default function page() {
         <VlcPlayerView
           ref={videoRef}
           source={{
-            uri: stream.url,
+            uri: stream?.url || "",
             autoplay: true,
             isNetwork: true,
             startPosition,
-            externalTrack,
+            externalSubtitles,
             initOptions,
           }}
           style={{ width: "100%", height: "100%" }}
           onVideoProgress={onProgress}
           progressUpdateInterval={1000}
           onVideoStateChange={onPlaybackStateChanged}
+          onPipStarted={onPipStarted}
           onVideoLoadStart={() => {}}
           onVideoLoadEnd={() => {
             setIsVideoLoaded(true);
@@ -474,7 +433,7 @@ export default function page() {
           }}
         />
       </View>
-      {videoRef.current && (
+      {videoRef.current && !isPipStarted && (
         <Controls
           mediaSource={stream?.mediaSource}
           item={item}
@@ -490,6 +449,7 @@ export default function page() {
           setIgnoreSafeAreas={setIgnoreSafeAreas}
           ignoreSafeAreas={ignoreSafeAreas}
           isVideoLoaded={isVideoLoaded}
+          startPictureInPicture={videoRef?.current?.startPictureInPicture}
           play={videoRef.current?.play}
           pause={videoRef.current?.pause}
           seek={videoRef.current?.seekTo}
@@ -506,23 +466,4 @@ export default function page() {
       )}
     </View>
   );
-}
-
-export function usePoster(
-  item: BaseItemDto,
-  api: Api | null
-): string | undefined {
-  const poster = useMemo(() => {
-    if (!item || !api) return undefined;
-    return item.Type === "Audio"
-      ? `${api.basePath}/Items/${item.AlbumId}/Images/Primary?tag=${item.AlbumPrimaryImageTag}&quality=90&maxHeight=200&maxWidth=200`
-      : getBackdropUrl({
-          api,
-          item: item,
-          quality: 70,
-          width: 200,
-        });
-  }, [item, api]);
-
-  return poster ?? undefined;
 }

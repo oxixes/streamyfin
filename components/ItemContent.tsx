@@ -3,6 +3,7 @@ import { Bitrate, BitrateSelector } from "@/components/BitrateSelector";
 import { DownloadSingleItem } from "@/components/DownloadItem";
 import { OverviewText } from "@/components/OverviewText";
 import { ParallaxScrollView } from "@/components/ParallaxPage";
+// const PlayButton = !Platform.isTV ? require("@/components/PlayButton") : null;
 import { PlayButton } from "@/components/PlayButton";
 import { PlayedStatus } from "@/components/PlayedStatus";
 import { SimilarItems } from "@/components/SimilarItems";
@@ -15,7 +16,6 @@ import useDefaultPlaySettings from "@/hooks/useDefaultPlaySettings";
 import { useImageColors } from "@/hooks/useImageColors";
 import { useOrientation } from "@/hooks/useOrientation";
 import { apiAtom } from "@/providers/JellyfinProvider";
-import { SubtitleHelper } from "@/utils/SubtitleHelper";
 import { useSettings } from "@/utils/atoms/settings";
 import { getLogoImageUrlById } from "@/utils/jellyfin/image/getLogoImageUrlById";
 import {
@@ -24,12 +24,12 @@ import {
 } from "@jellyfin/sdk/lib/generated-client/models";
 import { Image } from "expo-image";
 import { useNavigation } from "expo-router";
-import * as ScreenOrientation from "expo-screen-orientation";
+import * as ScreenOrientation from "@/packages/expo-screen-orientation";
 import { useAtom } from "jotai";
 import React, { useEffect, useMemo, useState } from "react";
-import { View } from "react-native";
+import { Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Chromecast } from "./Chromecast";
+const Chromecast = !Platform.isTV ? require("./Chromecast") : null;
 import { ItemHeader } from "./ItemHeader";
 import { ItemTechnicalDetails } from "./ItemTechnicalDetails";
 import { MediaSourceSelector } from "./MediaSourceSelector";
@@ -81,23 +81,29 @@ export const ItemContent: React.FC<{ item: BaseItemDto }> = React.memo(
       defaultMediaSource,
     ]);
 
-    useEffect(() => {
-      navigation.setOptions({
-        headerRight: () =>
-          item && (
-            <View className="flex flex-row items-center space-x-2">
-              <Chromecast background="blur" width={22} height={22} />
-              {item.Type !== "Program" && (
-                <View className="flex flex-row items-center space-x-2">
-                  <DownloadSingleItem item={item} size="large" />
-                  <PlayedStatus items={[item]} size="large" />
-                  <AddToFavorites item={item} type="item" />
-                </View>
-              )}
-            </View>
-          ),
-      });
-    }, [item]);
+    if (!Platform.isTV) {
+      useEffect(() => {
+        navigation.setOptions({
+          headerRight: () =>
+            item && (
+              <View className="flex flex-row items-center space-x-2">
+                <Chromecast.Chromecast
+                  background="blur"
+                  width={22}
+                  height={22}
+                />
+                {item.Type !== "Program" && (
+                  <View className="flex flex-row items-center space-x-2">
+                    <DownloadSingleItem item={item} size="large" />
+                    <PlayedStatus items={[item]} size="large" />
+                    <AddToFavorites item={item} type="item" />
+                  </View>
+                )}
+              </View>
+            ),
+        });
+      }, [item]);
+    }
 
     useEffect(() => {
       if (orientation !== ScreenOrientation.OrientationLock.PORTRAIT_UP)
@@ -111,37 +117,6 @@ export const ItemContent: React.FC<{ item: BaseItemDto }> = React.memo(
     const loading = useMemo(() => {
       return Boolean(logoUrl && loadingLogo);
     }, [loadingLogo, logoUrl]);
-
-    const [isTranscoding, setIsTranscoding] = useState(false);
-    const [previouslyChosenSubtitleIndex, setPreviouslyChosenSubtitleIndex] =
-      useState<number | undefined>(selectedOptions?.subtitleIndex);
-
-    useEffect(() => {
-      const isTranscoding = Boolean(selectedOptions?.bitrate.value);
-      if (isTranscoding) {
-        setPreviouslyChosenSubtitleIndex(selectedOptions?.subtitleIndex);
-        const subHelper = new SubtitleHelper(
-          selectedOptions?.mediaSource?.MediaStreams ?? []
-        );
-
-        const newSubtitleIndex = subHelper.getMostCommonSubtitleByName(
-          selectedOptions?.subtitleIndex
-        );
-
-        setSelectedOptions((prev) => ({
-          ...prev!,
-          subtitleIndex: newSubtitleIndex ?? -1,
-        }));
-      }
-      if (!isTranscoding && previouslyChosenSubtitleIndex !== undefined) {
-        setSelectedOptions((prev) => ({
-          ...prev!,
-          subtitleIndex: previouslyChosenSubtitleIndex,
-        }));
-      }
-      setIsTranscoding(isTranscoding);
-    }, [selectedOptions?.bitrate]);
-
     if (!selectedOptions) return null;
 
     return (
@@ -189,9 +164,10 @@ export const ItemContent: React.FC<{ item: BaseItemDto }> = React.memo(
           }
         >
           <View className="flex flex-col bg-transparent shrink">
+            {/* {!Platform.isTV && ( */}
             <View className="flex flex-col px-4 w-full space-y-2 pt-2 mb-2 shrink">
               <ItemHeader item={item} className="mb-4" />
-              {item.Type !== "Program" && (
+              {item.Type !== "Program" && !Platform.isTV && (
                 <View className="flex flex-row items-center justify-start w-full h-16">
                   <BitrateSelector
                     className="mr-1"
@@ -231,7 +207,6 @@ export const ItemContent: React.FC<{ item: BaseItemDto }> = React.memo(
                     selected={selectedOptions.audioIndex}
                   />
                   <SubtitleTrackSelector
-                    isTranscoding={isTranscoding}
                     source={selectedOptions.mediaSource}
                     onChange={(val) =>
                       setSelectedOptions(
@@ -247,11 +222,13 @@ export const ItemContent: React.FC<{ item: BaseItemDto }> = React.memo(
                 </View>
               )}
 
+              {/* {!Platform.isTV && ( */}
               <PlayButton
                 className="grow"
                 selectedOptions={selectedOptions}
                 item={item}
               />
+              {/* )} */}
             </View>
 
             {item.Type === "Episode" && (
